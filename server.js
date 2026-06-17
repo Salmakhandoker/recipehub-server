@@ -294,3 +294,277 @@ app.get('/api/auth/me', verifyToken, async (req, res) => {
     return res.status(500).json({ success: false, message: "Internal server error" });
   }
 });
+
+// ==========================================
+// RECIPES API ENDPOINTS
+// ==========================================
+
+// Create Recipe (Protected, 2 recipe limit for normal users)
+app.post('/api/recipes', verifyToken, async (req, res) => {
+  const {
+    recipeName,
+    recipeImage,
+    category,
+    cuisineType,
+    difficultyLevel,
+    preparationTime,
+    ingredients,
+    instructions
+  } = req.body;
+
+  if (!recipeName || !category || !cuisineType || !difficultyLevel || !preparationTime || !ingredients || !instructions) {
+    return res.status(400).json({ success: false, message: "Required fields are missing" });
+  }
+
+  try {
+    const recipesCollection = getCollection('recipes');
+    
+    // Check if the user has reached their limit (if not premium)
+    if (!req.user.isPremium && req.user.role !== 'admin') {
+      const count = await recipesCollection.countDocuments({ authorEmail: req.user.email });
+      if (count >= 2) {
+        return res.status(403).json({
+          success: false,
+          message: "Limit reached: Standard members can only post up to 2 recipes. Upgrade to Premium to post unlimited recipes!"
+        });
+      }
+    }
+
+    const newRecipe = {
+      recipeName,
+      recipeImage: recipeImage || "https://images.unsplash.com/photo-1546069901-ba9599a7e63c",
+      category,
+      cuisineType,
+      difficultyLevel,
+      preparationTime: parseInt(preparationTime, 10),
+      ingredients: Array.isArray(ingredients) ? ingredients : ingredients.split(',').map(i => i.trim()),
+      instructions,
+      authorId: req.user.id,
+      authorName: req.user.name,
+      authorEmail: req.user.email,
+      likesCount: 0,
+      isFeatured: false,
+      status: 'published',
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const result = await recipesCollection.insertOne(newRecipe);
+    return res.status(201).json({
+      success: true,
+      message: "Recipe created successfully!",
+      recipeId: result.insertedId
+    });
+
+  } catch (error) {
+    console.error("Create Recipe Error:", error);
+    return res.status(500).json({ success: false, message: "Failed to create recipe" });
+  }
+});
+
+// Get All Recipes (Public, category filter via $in, pagination, search)
+app.get('/api/recipes', async (req, res) => {
+  const { category, search, page = 1, limit = 6 } = req.query;
+  
+  const query = { status: 'published' };
+  
+  // Apply Search filter (case-insensitive on name)
+  if (search) {
+    query.recipeName = { $regex: search, $options: 'i' };
+  }
+
+  // Apply Category filter using MongoDB $in
+  if (category) {
+    const categories = Array.isArray(category)
+      ? category 
+      : category.split(',').map(c => c.trim()).filter(Boolean);
+    
+    if (categories.length > 0) {
+      query.category = { $in: categories };
+    }
+  }
+
+  try {
+    const recipesCollection = getCollection('recipes');
+    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
+    const parsedLimit = parseInt(limit, 10);
+
+    const totalRecipes = await recipesCollection.countDocuments(query);
+    const recipes = await recipesCollection.find(query)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parsedLimit)
+      .toArray();
+
+    return res.json({
+      success: true,
+      data: recipes,
+      pagination: {
+        totalRecipes,
+        page: parseInt(page, 10),
+        limit: parsedLimit,
+        totalPages: Math.ceil(totalRecipes / parsedLimit)
+      }
+    });
+
+  } catch (error) {
+    console.error("Get Recipes Error:", error);
+    return res.status(500).json({ success: false, message: "Failed to fetch recipes" });
+  }
+});
+
+// Get Featured Recipes
+app.get('/api/recipes/featured', async (req, res) => {
+  try {
+    const recipesCollection = getCollection('recipes');
+    const featured = await recipesCollection.find({ isFeatured: true, status: 'published' }).limit(6).toArray();
+    return res.json({ success: true, data: featured });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to fetch featured recipes" });
+  }
+});
+
+// Get Popular Recipes (Sorted by likes count)
+app.get('/api/recipes/popular', async (req, res) => {
+  try {
+    const recipesCollection = getCollection('recipes');
+    const popular = await recipesCollection.find({ status: 'published' })
+      .sort({ likesCount: -1 })
+      .limit(6)
+      .toArray();
+    return res.json({ success: true, data: popular });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to fetch popular recipes" });
+  }
+});
+
+// Get Single Recipe Details
+app.get('/api/recipes/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const recipesCollection = getCollection('recipes');
+    const recipe = await recipesCollection.findOne({ _id: new ObjectId(id) });
+    if (!recipe) {
+      return res.status(404).json({ success: false, message: "Recipe not found" });
+    }
+    return res.json({ success: true, data: recipe });
+  } catch (error) {
+    return res.status(400).json({ success: false, message: "Invalid Recipe ID" });
+  }
+});
+
+// Update Recipe (Protected)
+app.put('/api/recipes/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body;
+  
+  try {
+    const recipesCollection = getCollection('recipes');
+    const recipe = await recipesCollection.findOne({ _id: new ObjectId(id) });
+    
+    if (!recipe) {
+      return res.status(404).json({ success: false, message: "Recipe not found" });
+    }
+
+    // Must be author or admin
+    if (recipe.authorEmail !== req.user.email && req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, message: "Forbidden: You are not authorized to edit this recipe" });
+    }
+
+    // Strip uneditable fields
+    const { _id, authorId, authorEmail, authorName, likesCount, createdAt, ...allowedUpdates } = updates;
+    allowedUpdates.updatedAt = new Date();
+    
+    if (allowedUpdates.preparationTime) {
+      allowedUpdates.preparationTime = parseInt(allowedUpdates.preparationTime, 10);
+    }
+    if (allowedUpdates.ingredients && !Array.isArray(allowedUpdates.ingredients)) {
+      allowedUpdates.ingredients = allowedUpdates.ingredients.split(',').map(i => i.trim());
+    }
+
+    await recipesCollection.updateOne({ _id: new ObjectId(id) }, { $set: allowedUpdates });
+    return res.json({ success: true, message: "Recipe updated successfully" });
+
+  } catch (error) {
+    console.error("Update Recipe Error:", error);
+    return res.status(500).json({ success: false, message: "Failed to update recipe" });
+  }
+});
+
+// Delete Recipe (Protected)
+app.delete('/api/recipes/:id', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const recipesCollection = getCollection('recipes');
+    const recipe = await recipesCollection.findOne({ _id: new ObjectId(id) });
+    if (!recipe) {
+      return res.status(404).json({ success: false, message: "Recipe not found" });
+    }
+
+    // Must be author or admin
+    if (recipe.authorEmail !== req.user.email && req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, message: "Forbidden: You are not authorized to delete this recipe" });
+    }
+
+    await recipesCollection.deleteOne({ _id: new ObjectId(id) });
+    return res.json({ success: true, message: "Recipe deleted successfully" });
+
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to delete recipe" });
+  }
+});
+
+// Like Recipe (Protected)
+app.post('/api/recipes/:id/like', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const recipesCollection = getCollection('recipes');
+    const result = await recipesCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $inc: { likesCount: 1 } }
+    );
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: "Recipe not found" });
+    }
+    
+    // Optional: Increment total likes received by the recipe author
+    const recipe = await recipesCollection.findOne({ _id: new ObjectId(id) });
+    if (recipe) {
+      const usersCollection = getCollection('users');
+      await usersCollection.updateOne(
+        { email: recipe.authorEmail },
+        { $inc: { totalLikesReceived: 1 } } // we can track this for user stats
+      );
+    }
+
+    return res.json({ success: true, message: "Recipe liked!" });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to like recipe" });
+  }
+});
+
+// Report Recipe (Protected)
+app.post('/api/recipes/:id/report', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const { reason } = req.body;
+  
+  if (!reason || !['Spam', 'Offensive Content', 'Copyright Issue'].includes(reason)) {
+    return res.status(400).json({ success: false, message: "Valid reason is required (Spam, Offensive Content, Copyright Issue)" });
+  }
+
+  try {
+    const reportsCollection = getCollection('reports');
+    const report = {
+      recipeId: new ObjectId(id),
+      reporterEmail: req.user.email,
+      reason,
+      status: 'pending',
+      createdAt: new Date()
+    };
+    await reportsCollection.insertOne(report);
+    return res.json({ success: true, message: "Recipe reported successfully" });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to report recipe" });
+  }
+});
+
