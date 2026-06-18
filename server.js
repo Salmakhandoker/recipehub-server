@@ -7,21 +7,37 @@ import { ObjectId } from 'mongodb';
 import { connectDB, getCollection } from './db.js';
 import { toNodeHandler } from "better-auth/node";
 import { auth } from "./auth.js";
-import { verifyToken } from './jwtMiddleware.js';
+import { verifyToken, verifyAdmin } from './jwtMiddleware.js';
+import Stripe from 'stripe';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Mount Better Auth handler (must go before express.json middleware)
-app.all("/api/auth/*", toNodeHandler(auth));
-
 // Middleware
 app.use(cors({
   origin: ['http://localhost:3000', 'http://127.0.0.1:3000'],
   credentials: true
 }));
+
+// Mount Better Auth handler (must go before express.json middleware)
+app.all("/api/auth/*", (req, res, next) => {
+  const customPaths = [
+    '/api/auth/register',
+    '/api/auth/login',
+    '/api/auth/google-callback',
+    '/api/auth/logout',
+    '/api/auth/me',
+    '/api/auth/stats',
+    '/api/auth/profile'
+  ];
+  if (customPaths.includes(req.path)) {
+    return next();
+  }
+  return toNodeHandler(auth)(req, res, next);
+});
+
 app.use(express.json());
 app.use(cookieParser());
 
@@ -47,7 +63,7 @@ app.get('/api/health', (req, res) => {
 
 // Register
 app.post('/api/auth/register', async (req, res) => {
-  const { name, email, image, password } = req.body;
+  const { name, email, image, password, role } = req.body;
   if (!name || !email || !password) {
     return res.status(400).json({ success: false, message: "Name, email, and password are required" });
   }
@@ -69,33 +85,40 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
     // Call Better Auth to register
-    await auth.api.signUpEmail({
+    const signUpResult = await auth.api.signUpEmail({
       body: {
         email: email.toLowerCase(),
         password,
         name,
-        image: image || "https://i.ibb.co/Vvpwk7R/default-avatar.png"
+        image: image || "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150"
       }
     });
 
-    // Fetch the newly created user (or update properties if needed)
-    const user = await usersCollection.findOne({ email: email.toLowerCase() });
+    if (!signUpResult || !signUpResult.user) {
+      return res.status(500).json({ success: false, message: "Authentication provider failed to register user." });
+    }
+
+    const userId = signUpResult.user.id;
+    const userObjectId = new ObjectId(userId);
+
+    // Determine the role: default to 'user', allow setting 'admin'
+    const finalRole = (role === 'admin' || email.toLowerCase().includes('admin')) ? 'admin' : 'user';
 
     // Initialize custom fields if they don't exist
     await usersCollection.updateOne(
-      { _id: user._id },
+      { _id: userObjectId },
       {
         $set: {
-          role: user.role || 'user',
-          isBlocked: user.isBlocked || false,
-          isPremium: user.isPremium || false,
-          createdAt: user.createdAt || new Date(),
-          updatedAt: user.updatedAt || new Date()
+          role: finalRole,
+          isBlocked: signUpResult.user.isBlocked || false,
+          isPremium: signUpResult.user.isPremium || false,
+          createdAt: signUpResult.user.createdAt || new Date(),
+          updatedAt: signUpResult.user.updatedAt || new Date()
         }
       }
     );
 
-    const updatedUser = await usersCollection.findOne({ _id: user._id });
+    const updatedUser = await usersCollection.findOne({ _id: userObjectId });
 
     // Generate JWT token
     const token = jwt.sign(
@@ -210,7 +233,7 @@ app.post('/api/auth/google-callback', async (req, res) => {
       const insertResult = await usersCollection.insertOne({
         name: name || "Google User",
         email: email.toLowerCase(),
-        image: image || "https://i.ibb.co/Vvpwk7R/default-avatar.png",
+        image: image || "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150",
         role: 'user',
         isBlocked: false,
         isPremium: false,
@@ -229,7 +252,7 @@ app.post('/api/auth/google-callback', async (req, res) => {
     const token = jwt.sign(
       { id: user._id.toString(), email: user.email, role: user.role || 'user' },
       process.env.JWT_SECRET || 'recipehub_jwt_secret_token_key_2026_xoxo',
-      { expiresIn: '7d' }
+      { expiresIn: '10d' }
     );
 
     // Store JWT in HTTPOnly Cookie
@@ -237,7 +260,7 @@ app.post('/api/auth/google-callback', async (req, res) => {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000
+      maxAge: 10 * 24 * 60 * 60 * 1000
     });
 
     return res.json({
@@ -567,4 +590,584 @@ app.post('/api/recipes/:id/report', verifyToken, async (req, res) => {
     return res.status(500).json({ success: false, message: "Failed to report recipe" });
   }
 });
+
+// ==========================================
+// FAVORITES API ENDPOINTS
+// ==========================================
+
+// Add Recipe to Favorites (Protected)
+app.post('/api/favorites', verifyToken, async (req, res) => {
+  const { recipeId } = req.body;
+  if (!recipeId) {
+    return res.status(400).json({ success: false, message: "Recipe ID is required" });
+  }
+
+  try {
+    const favoritesCollection = getCollection('favorites');
+    
+    // Check if already in favorites
+    const existing = await favoritesCollection.findOne({
+      userId: req.user.id,
+      recipeId: new ObjectId(recipeId)
+    });
+
+    if (existing) {
+      return res.status(400).json({ success: false, message: "Recipe is already in your favorites" });
+    }
+
+    const newFavorite = {
+      userEmail: req.user.email,
+      userId: req.user.id,
+      recipeId: new ObjectId(recipeId),
+      addedAt: new Date()
+    };
+
+    await favoritesCollection.insertOne(newFavorite);
+    return res.status(201).json({ success: true, message: "Added to favorites" });
+
+  } catch (error) {
+    console.error("Add Favorite Error:", error);
+    return res.status(500).json({ success: false, message: "Failed to add to favorites" });
+  }
+});
+
+// Remove Recipe from Favorites (Protected)
+app.delete('/api/favorites/:recipeId', verifyToken, async (req, res) => {
+  const { recipeId } = req.params;
+  try {
+    const favoritesCollection = getCollection('favorites');
+    const result = await favoritesCollection.deleteOne({
+      userId: req.user.id,
+      recipeId: new ObjectId(recipeId)
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: "Favorite recipe not found" });
+    }
+
+    return res.json({ success: true, message: "Removed from favorites" });
+
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to remove from favorites" });
+  }
+});
+
+// List Favorite Recipes (Protected, joins with recipes collection)
+app.get('/api/favorites', verifyToken, async (req, res) => {
+  try {
+    const favoritesCollection = getCollection('favorites');
+    const favorites = await favoritesCollection.aggregate([
+      { $match: { userId: req.user.id } },
+      {
+        $lookup: {
+          from: 'recipes',
+          localField: 'recipeId',
+          foreignField: '_id',
+          as: 'recipeDetails'
+        }
+      },
+      { $unwind: '$recipeDetails' },
+      {
+        $project: {
+          _id: 1,
+          addedAt: 1,
+          recipeId: '$recipeDetails._id',
+          recipeName: '$recipeDetails.recipeName',
+          recipeImage: '$recipeDetails.recipeImage',
+          category: '$recipeDetails.category',
+          cuisineType: '$recipeDetails.cuisineType',
+          difficultyLevel: '$recipeDetails.difficultyLevel',
+          preparationTime: '$recipeDetails.preparationTime',
+          authorName: '$recipeDetails.authorName'
+        }
+      }
+    ]).toArray();
+
+    return res.json({ success: true, data: favorites });
+
+  } catch (error) {
+    console.error("Get Favorites Error:", error);
+    return res.status(500).json({ success: false, message: "Failed to fetch favorites" });
+  }
+});
+
+// ==========================================
+// PAYMENTS & STRIPE API ENDPOINTS
+// ==========================================
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// Create Checkout Session
+app.post('/api/create-checkout-session', verifyToken, async (req, res) => {
+  const { type, recipeId } = req.body; // type can be 'premium' or 'recipe'
+  
+  if (!type || !['premium', 'recipe'].includes(type)) {
+    return res.status(400).json({ success: false, message: "Valid purchase type is required (premium or recipe)" });
+  }
+
+  try {
+    let line_items = [];
+    let metadata = {
+      userId: req.user.id,
+      userEmail: req.user.email,
+      type
+    };
+
+    if (type === 'premium') {
+      line_items = [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: 'RecipeHub Premium Membership Upgrade',
+            description: 'Unlocks unlimited recipe submissions and premium badge on your profile.',
+          },
+          unit_amount: 999, // $9.99
+        },
+        quantity: 1,
+      }];
+    } else {
+      if (!recipeId) {
+        return res.status(400).json({ success: false, message: "Recipe ID is required for recipe purchase" });
+      }
+      
+      const recipesCollection = getCollection('recipes');
+      const recipe = await recipesCollection.findOne({ _id: new ObjectId(recipeId) });
+      
+      if (!recipe) {
+        return res.status(404).json({ success: false, message: "Recipe not found" });
+      }
+
+      line_items = [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: `Recipe Purchase: ${recipe.recipeName}`,
+            description: `Author: ${recipe.authorName} | Cuisine: ${recipe.cuisineType}`,
+            images: [recipe.recipeImage],
+          },
+          unit_amount: 499, // $4.99
+        },
+        quantity: 1,
+      }];
+      
+      metadata.recipeId = recipeId;
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items,
+      mode: 'payment',
+      success_url: `http://localhost:3000/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `http://localhost:3000/recipes`,
+      metadata
+    });
+
+    return res.json({ success: true, url: session.url });
+
+  } catch (error) {
+    console.error("Create Stripe Session Error:", error);
+    return res.status(500).json({ success: false, message: "Failed to create checkout session" });
+  }
+});
+
+// Verify Stripe Payment Session
+app.post('/api/payments/verify', verifyToken, async (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) {
+    return res.status(400).json({ success: false, message: "Session ID is required" });
+  }
+
+  try {
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (session.payment_status !== 'paid') {
+      return res.status(400).json({ success: false, message: "Payment was not completed successfully" });
+    }
+
+    const { type, userId, userEmail, recipeId } = session.metadata;
+    const paymentsCollection = getCollection('payments');
+    
+    // Check if this payment intent has already been saved
+    const paymentIntent = session.payment_intent;
+    const existingPayment = await paymentsCollection.findOne({ transactionId: paymentIntent });
+
+    if (existingPayment) {
+      return res.json({
+        success: true,
+        message: "Payment verified (already processed)",
+        data: existingPayment
+      });
+    }
+
+    // Record the payment in the DB
+    const newPayment = {
+      userEmail,
+      userId,
+      amount: session.amount_total / 100,
+      recipeId: recipeId ? new ObjectId(recipeId) : null,
+      transactionId: paymentIntent,
+      paymentStatus: 'paid',
+      paidAt: new Date()
+    };
+
+    await paymentsCollection.insertOne(newPayment);
+
+    // If type is premium, update user isPremium status
+    if (type === 'premium') {
+      const usersCollection = getCollection('users');
+      await usersCollection.updateOne(
+        { email: userEmail },
+        { $set: { isPremium: true, updatedAt: new Date() } }
+      );
+    }
+
+    return res.json({
+      success: true,
+      message: "Payment successfully verified and saved!",
+      data: newPayment
+    });
+
+  } catch (error) {
+    console.error("Verify Stripe Session Error:", error);
+    return res.status(500).json({ success: false, message: "Failed to verify payment session" });
+  }
+});
+
+// List Purchased Recipes for current user
+app.get('/api/payments/purchased', verifyToken, async (req, res) => {
+  try {
+    const paymentsCollection = getCollection('payments');
+    const purchases = await paymentsCollection.aggregate([
+      { 
+        $match: { 
+          userId: req.user.id, 
+          recipeId: { $ne: null } 
+        } 
+      },
+      {
+        $lookup: {
+          from: 'recipes',
+          localField: 'recipeId',
+          foreignField: '_id',
+          as: 'recipeDetails'
+        }
+      },
+      { $unwind: '$recipeDetails' },
+      {
+        $project: {
+          _id: 1,
+          paidAt: 1,
+          amount: 1,
+          transactionId: 1,
+          recipeId: '$recipeDetails._id',
+          recipeName: '$recipeDetails.recipeName',
+          recipeImage: '$recipeDetails.recipeImage',
+          category: '$recipeDetails.category',
+          cuisineType: '$recipeDetails.cuisineType',
+          difficultyLevel: '$recipeDetails.difficultyLevel',
+          preparationTime: '$recipeDetails.preparationTime',
+          authorName: '$recipeDetails.authorName'
+        }
+      }
+    ]).toArray();
+
+    return res.json({ success: true, data: purchases });
+
+  } catch (error) {
+    console.error("Get Purchased Recipes Error:", error);
+    return res.status(500).json({ success: false, message: "Failed to fetch purchased recipes" });
+  }
+});
+
+// ==========================================
+// ADMIN DASHBOARD API ENDPOINTS
+// ==========================================
+
+// Get Admin Overview Stats (Protected)
+app.get('/api/admin/stats', verifyAdmin, async (req, res) => {
+  try {
+    const usersCollection = getCollection('users');
+    const recipesCollection = getCollection('recipes');
+    const reportsCollection = getCollection('reports');
+
+    const totalUsers = await usersCollection.countDocuments();
+    const totalRecipes = await recipesCollection.countDocuments();
+    const totalPremiumMembers = await usersCollection.countDocuments({ isPremium: true });
+    const totalReports = await reportsCollection.countDocuments();
+
+    return res.json({
+      success: true,
+      data: {
+        totalUsers,
+        totalRecipes,
+        totalPremiumMembers,
+        totalReports
+      }
+    });
+  } catch (error) {
+    console.error("Admin Stats Error:", error);
+    return res.status(500).json({ success: false, message: "Failed to fetch admin stats" });
+  }
+});
+
+// Manage Users: View All Users (Protected)
+app.get('/api/admin/users', verifyAdmin, async (req, res) => {
+  try {
+    const usersCollection = getCollection('users');
+    const users = await usersCollection.find().toArray();
+    return res.json({ success: true, data: users });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to fetch users" });
+  }
+});
+
+// Manage Users: Block User (Protected)
+app.put('/api/admin/users/:id/block', verifyAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const usersCollection = getCollection('users');
+    
+    // Prevent blocking oneself
+    const userToBlock = await usersCollection.findOne({ _id: new ObjectId(id) });
+    if (userToBlock && userToBlock.email === req.user.email) {
+      return res.status(400).json({ success: false, message: "You cannot block yourself!" });
+    }
+
+    const result = await usersCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { isBlocked: true, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    // Force sign-out of the user by deleting sessions
+    const sessionsCollection = getCollection('sessions');
+    await sessionsCollection.deleteMany({ userId: id });
+
+    return res.json({ success: true, message: "User successfully blocked" });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to block user" });
+  }
+});
+
+// Manage Users: Unblock User (Protected)
+app.put('/api/admin/users/:id/unblock', verifyAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const usersCollection = getCollection('users');
+    const result = await usersCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { isBlocked: false, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    return res.json({ success: true, message: "User successfully unblocked" });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to unblock user" });
+  }
+});
+
+// Manage Recipes: View All Recipes (Protected)
+app.get('/api/admin/recipes', verifyAdmin, async (req, res) => {
+  try {
+    const recipesCollection = getCollection('recipes');
+    const recipes = await recipesCollection.find().toArray();
+    return res.json({ success: true, data: recipes });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to fetch recipes" });
+  }
+});
+
+// Manage Recipes: Toggle Feature Recipe (Protected)
+app.put('/api/admin/recipes/:id/feature', verifyAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { isFeatured } = req.body;
+  try {
+    const recipesCollection = getCollection('recipes');
+    const result = await recipesCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { isFeatured: !!isFeatured, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: "Recipe not found" });
+    }
+
+    return res.json({
+      success: true,
+      message: isFeatured ? "Recipe added to featured section" : "Recipe removed from featured section"
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to feature recipe" });
+  }
+});
+
+// Manage Recipes: Delete Recipe (Protected)
+app.delete('/api/admin/recipes/:id', verifyAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const recipesCollection = getCollection('recipes');
+    const result = await recipesCollection.deleteOne({ _id: new ObjectId(id) });
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: "Recipe not found" });
+    }
+
+    // Clean up reports for this recipe
+    const reportsCollection = getCollection('reports');
+    await reportsCollection.deleteMany({ recipeId: new ObjectId(id) });
+
+    return res.json({ success: true, message: "Recipe successfully deleted" });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to delete recipe" });
+  }
+});
+
+// Recipe Reports: View All Reports (Protected)
+app.get('/api/admin/reports', verifyAdmin, async (req, res) => {
+  try {
+    const reportsCollection = getCollection('reports');
+    const reports = await reportsCollection.aggregate([
+      {
+        $lookup: {
+          from: 'recipes',
+          localField: 'recipeId',
+          foreignField: '_id',
+          as: 'recipeDetails'
+        }
+      },
+      { $unwind: '$recipeDetails' },
+      {
+        $project: {
+          _id: 1,
+          recipeId: 1,
+          reporterEmail: 1,
+          reason: 1,
+          status: 1,
+          createdAt: 1,
+          recipeName: '$recipeDetails.recipeName',
+          recipeAuthor: '$recipeDetails.authorName',
+          recipeAuthorEmail: '$recipeDetails.authorEmail'
+        }
+      }
+    ]).toArray();
+
+    return res.json({ success: true, data: reports });
+  } catch (error) {
+    console.error("Get Reports Error:", error);
+    return res.status(500).json({ success: false, message: "Failed to fetch reports" });
+  }
+});
+
+// Recipe Reports: Dismiss Report (Protected)
+app.put('/api/admin/reports/:id/dismiss', verifyAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const reportsCollection = getCollection('reports');
+    const result = await reportsCollection.deleteOne({ _id: new ObjectId(id) });
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: "Report not found" });
+    }
+    return res.json({ success: true, message: "Report successfully dismissed" });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to dismiss report" });
+  }
+});
+
+// Transactions: View All Payments (Protected)
+app.get('/api/admin/transactions', verifyAdmin, async (req, res) => {
+  try {
+    const paymentsCollection = getCollection('payments');
+    const transactions = await paymentsCollection.find().sort({ paidAt: -1 }).toArray();
+    return res.json({ success: true, data: transactions });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to fetch transactions" });
+  }
+});
+
+// Update User Profile (Protected)
+app.put('/api/auth/profile', verifyToken, async (req, res) => {
+  const { name, image } = req.body;
+  if (!name && !image) {
+    return res.status(400).json({ success: false, message: "Please provide name or image to update" });
+  }
+
+  try {
+    const usersCollection = getCollection('users');
+    const updateDoc = { updatedAt: new Date() };
+    if (name) updateDoc.name = name;
+    if (image) updateDoc.image = image;
+
+    const result = await usersCollection.updateOne(
+      { email: req.user.email },
+      { $set: updateDoc }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    // Return updated user
+    const updatedUser = await usersCollection.findOne({ email: req.user.email });
+    return res.json({
+      success: true,
+      message: "Profile updated successfully",
+      user: {
+        id: updatedUser._id.toString(),
+        name: updatedUser.name,
+        email: updatedUser.email,
+        image: updatedUser.image,
+        role: updatedUser.role || 'user',
+        isPremium: updatedUser.isPremium || false
+      }
+    });
+
+  } catch (error) {
+    console.error("Profile Update Error:", error);
+    return res.status(500).json({ success: false, message: "Failed to update profile" });
+  }
+});
+
+// Get Logged-in User Stats Overview
+app.get('/api/auth/stats', verifyToken, async (req, res) => {
+  try {
+    const recipesCollection = getCollection('recipes');
+    const favoritesCollection = getCollection('favorites');
+
+    const totalRecipes = await recipesCollection.countDocuments({ authorEmail: req.user.email });
+    const totalFavorites = await favoritesCollection.countDocuments({ userId: req.user.id });
+
+    // Sum likesCount of all recipes authored by the user
+    const recipes = await recipesCollection.find({ authorEmail: req.user.email }).toArray();
+    const totalLikesReceived = recipes.reduce((sum, r) => sum + (r.likesCount || 0), 0);
+
+    return res.json({
+      success: true,
+      data: {
+        totalRecipes,
+        totalFavorites,
+        totalLikesReceived
+      }
+    });
+  } catch (error) {
+    console.error("User Stats Error:", error);
+    return res.status(500).json({ success: false, message: "Failed to fetch user stats overview" });
+  }
+});
+
+// Global Error Handler
+app.use((err, req, res, next) => {
+  console.error("Unhandled Server Error:", err);
+  res.status(err.status || 500).json({
+    success: false,
+    message: err.message || "An unexpected error occurred"
+  });
+});
+
+
+
+
 

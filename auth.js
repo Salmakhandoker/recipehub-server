@@ -16,6 +16,10 @@ export const auth = betterAuth({
       account: "accounts",
     },
   }),
+  trustedOrigins: [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000"
+  ],
   emailAndPassword: {
     enabled: true,
     autoSignIn: true,
