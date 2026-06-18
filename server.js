@@ -151,6 +151,8 @@ app.post('/api/auth/register', async (req, res) => {
         isPremium: updatedUser.isPremium || false
       }
     });
+    console.log("signUpResult =", signUpResult);
+console.log("userId =", signUpResult?.user?.id);
 
   } catch (error) {
     console.error("Register Error:", error);
