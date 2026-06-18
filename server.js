@@ -124,7 +124,7 @@ app.post('/api/auth/register', async (req, res) => {
     const token = jwt.sign(
       { id: updatedUser._id.toString(), email: updatedUser.email, role: updatedUser.role || 'user' },
       process.env.JWT_SECRET || 'recipehub_jwt_secret_token_key_2026_xoxo',
-      { expiresIn: '7d' }
+      { expiresIn: '10d' }
     );
 
     // Store JWT in HTTPOnly Cookie
@@ -132,7 +132,7 @@ app.post('/api/auth/register', async (req, res) => {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax', // standard lax is best for cross-origin local cookies
-      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+      maxAge: 10 * 24 * 60 * 60 * 1000 // 10 days
     });
 
     return res.status(201).json({
@@ -194,7 +194,7 @@ app.post('/api/auth/login', async (req, res) => {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000
+      maxAge: 10 * 24 * 60 * 60 * 1000
     });
 
     return res.json({
