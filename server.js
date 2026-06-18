@@ -121,10 +121,13 @@ app.post('/api/auth/register', async (req, res) => {
     const updatedUser = await usersCollection.findOne({ _id: userObjectId });
 
     // Generate JWT token
+   console.log("updatedUser =", updatedUser);
     const token = jwt.sign(
+
       { id: updatedUser._id.toString(), email: updatedUser.email, role: updatedUser.role || 'user' },
       process.env.JWT_SECRET || 'recipehub_jwt_secret_token_key_2026_xoxo',
       { expiresIn: '10d' }
+      
     );
 
     // Store JWT in HTTPOnly Cookie
