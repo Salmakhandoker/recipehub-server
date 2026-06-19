@@ -12,6 +12,14 @@ import Stripe from 'stripe';
 
 dotenv.config();
 
+const getUserIdQuery = (id) => {
+  try {
+    return { $or: [{ _id: id }, { _id: new ObjectId(id) }] };
+  } catch (e) {
+    return { _id: id };
+  }
+};
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -57,171 +65,451 @@ app.get('/api/health', (req, res) => {
   res.json({ status: "ok", database: dbConnected });
 });
 
-// ==========================================
-// AUTHENTICATION API ENDPOINTS
-// ==========================================
+// chat-gpt code
 
-// Register
 app.post('/api/auth/register', async (req, res) => {
   const { name, email, image, password, role } = req.body;
-  if (!name || !email || !password) {
-    return res.status(400).json({ success: false, message: "Name, email, and password are required" });
-  }
-
-  // Password Rules: min 6 chars, 1 uppercase, 1 lowercase
-  const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z]).{6,}$/;
-  if (!passwordRegex.test(password)) {
-    return res.status(400).json({
-      success: false,
-      message: "Password must be at least 6 characters, and contain at least one uppercase letter and one lowercase letter."
-    });
-  }
 
   try {
-    const usersCollection = getCollection('users');
-    const existingUser = await usersCollection.findOne({ email: email.toLowerCase() });
-    if (existingUser) {
-      return res.status(400).json({ success: false, message: "Email already registered" });
+    if (!name || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Name, email and password are required"
+      });
     }
 
-    // Call Better Auth to register
+    const usersCollection = getCollection("users");
+
+    // Check existing user
+    const existingUser = await usersCollection.findOne({
+      email: email.toLowerCase()
+    });
+
+    if (existingUser) {
+      return res.status(400).json({
+        success: false,
+        message: "Email already registered"
+      });
+    }
+
+    // Better Auth signup
     const signUpResult = await auth.api.signUpEmail({
       body: {
+        name,
         email: email.toLowerCase(),
         password,
-        name,
-        image: image || "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150"
+        image:
+          image ||
+          "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150"
       }
     });
 
-    if (!signUpResult || !signUpResult.user) {
-      return res.status(500).json({ success: false, message: "Authentication provider failed to register user." });
+    if (!signUpResult?.user) {
+      return res.status(500).json({
+        success: false,
+        message: "Signup failed"
+      });
     }
 
     const userId = signUpResult.user.id;
-    const userObjectId = new ObjectId(userId);
 
-    // Determine the role: default to 'user', allow setting 'admin'
-    const finalRole = (role === 'admin' || email.toLowerCase().includes('admin')) ? 'admin' : 'user';
+    const finalRole =
+      role === "admin" || email.toLowerCase().includes("admin")
+        ? "admin"
+        : "user";
 
-    // Initialize custom fields if they don't exist
+
+        console.log("Searching user...");
+
+const userByEmail = await usersCollection.findOne({
+  email: email.toLowerCase()
+});
+
+console.log("userByEmail =", userByEmail);
+
+const userById = await usersCollection.findOne({
+  _id: signUpResult.user.id
+});
+
+console.log("userById =", userById);
+    // Update Better Auth created user
     await usersCollection.updateOne(
-      { _id: userObjectId },
+      { _id: userId },
       {
         $set: {
           role: finalRole,
-          isBlocked: signUpResult.user.isBlocked || false,
-          isPremium: signUpResult.user.isPremium || false,
-          createdAt: signUpResult.user.createdAt || new Date(),
-          updatedAt: signUpResult.user.updatedAt || new Date()
+          isBlocked: false,
+          isPremium: false,
+          updatedAt: new Date()
         }
       }
     );
 
-    const updatedUser = await usersCollection.findOne({ _id: userObjectId });
+    const user = await usersCollection.findOne({
+      _id: userId
+    });
 
-    // Generate JWT token
-   console.log("updatedUser =", updatedUser);
+    if (!user) {
+      return res.status(500).json({
+        success: false,
+        message: "User created but not found in database"
+      });
+    }
+
     const token = jwt.sign(
-
-      { id: updatedUser._id.toString(), email: updatedUser.email, role: updatedUser.role || 'user' },
-      process.env.JWT_SECRET || 'recipehub_jwt_secret_token_key_2026_xoxo',
-      { expiresIn: '10d' }
-      
+      {
+        id: user._id.toString(),
+        email: user.email,
+        role: user.role
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: "10d" }
     );
 
-    // Store JWT in HTTPOnly Cookie
-    res.cookie('token', token, {
+    res.cookie("token", token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax', // standard lax is best for cross-origin local cookies
-      maxAge: 10 * 24 * 60 * 60 * 1000 // 10 days
+      secure: false,
+      sameSite: "lax",
+      maxAge: 10 * 24 * 60 * 60 * 1000
     });
 
     return res.status(201).json({
       success: true,
-      message: "Registration successful",
       token,
-      user: {
-        id: updatedUser._id.toString(),
-        name: updatedUser.name,
-        email: updatedUser.email,
-        image: updatedUser.image,
-        role: updatedUser.role || 'user',
-        isPremium: updatedUser.isPremium || false
-      }
+      user
     });
-    console.log("signUpResult =", signUpResult);
-console.log("userId =", signUpResult?.user?.id);
-
   } catch (error) {
-    console.error("Register Error:", error);
-    return res.status(500).json({ success: false, message: error.message || "Registration failed" });
+    console.error("REGISTER ERROR:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: error.message
+    });
   }
 });
 
+// Register
+// app.post('/api/auth/register', async (req, res) => {
+//   const { name, email, image, password, role } = req.body;
+//   if (!name || !email || !password) {
+//     return res.status(400).json({ success: false, message: "Name, email, and password are required" });
+//   }
+
+  // Password Rules: min 6 chars, 1 uppercase, 1 lowercase
+//   const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z]).{6,}$/;
+//   if (!passwordRegex.test(password)) {
+//     return res.status(400).json({
+//       success: false,
+//       message: "Password must be at least 6 characters, and contain at least one uppercase letter and one lowercase letter."
+//     });
+//   }
+
+//   try {
+//     const usersCollection = getCollection('users');
+//     const existingUser = await usersCollection.findOne({ email: email.toLowerCase() });
+//     if (existingUser) {
+//       return res.status(400).json({ success: false, message: "Email already registered" });
+//     }
+
+//     // Call Better Auth to register
+//     const signUpResult = await auth.api.signUpEmail({
+//       body: {
+//         email: email.toLowerCase(),
+//         password,
+//         name,
+//         image: image || "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150"
+//       }
+//     });
+
+//     if (!signUpResult || !signUpResult.user) {
+//       return res.status(500).json({ success: false, message: "Authentication provider failed to register user." });
+//     }
+
+//     const userId = signUpResult.user.id;
+//     const userObjectId = new ObjectId(userId);
+
+//     // Determine the role: default to 'user', allow setting 'admin'
+//     const finalRole = (role === 'admin' || email.toLowerCase().includes('admin')) ? 'admin' : 'user';
+
+//     // Initialize custom fields if they don't exist
+//     await usersCollection.updateOne(
+//       { _id: userObjectId },
+//       {
+//         $set: {
+//           role: finalRole,
+//           isBlocked: signUpResult.user.isBlocked || false,
+//           isPremium: signUpResult.user.isPremium || false,
+//           createdAt: signUpResult.user.createdAt || new Date(),
+//           updatedAt: signUpResult.user.updatedAt || new Date()
+//         }
+//       }
+//     );
+
+//     const updatedUser = await usersCollection.findOne({ _id: userObjectId });
+// console.log("signUpResult =", signUpResult);
+
+// const checkUser = await usersCollection.findOne({
+//   email: email.toLowerCase()
+// });
+
+// console.log("checkUser =", checkUser);
+    // Generate JWT token
+  //  console.log("updatedUser =", updatedUser);
+  //   const token = jwt.sign(
+
+  //     { id: updatedUser._id.toString(), email: updatedUser.email, role: updatedUser.role || 'user' },
+  //     process.env.JWT_SECRET || 'recipehub_jwt_secret_token_key_2026_xoxo',
+  //     { expiresIn: '10d' }
+      
+  //   );
+  // ✅ Replace your current try block with this:
+// try {
+//   const usersCollection = getCollection('users');
+//   const existingUser = await usersCollection.findOne({ email: email.toLowerCase() });
+//   if (existingUser) {
+//     return res.status(400).json({ success: false, message: "Email already registered" });
+//   }
+
+  // Wrap Better Auth separately so we can handle its specific errors
+//   let signUpResult;
+//   try {
+//     signUpResult = await auth.api.signUpEmail({
+//       body: {
+//         email: email.toLowerCase(),
+//         password,
+//         name,
+//         image: image || "https://api.dicebear.com/7.x/initials/svg?seed=User"
+//       }
+//     });
+//   } catch (authError) {
+//     // Better Auth throws structured APIError objects
+//     const code = authError?.body?.code || '';
+//     if (code === 'USER_ALREADY_EXISTS_USE_ANOTHER_EMAIL') {
+//       return res.status(400).json({ success: false, message: "Email already registered" });
+//     }
+//     if (authError?.body?.message?.toLowerCase().includes('password')) {
+//       return res.status(400).json({ success: false, message: "Password must be at least 8 characters with uppercase and lowercase letters." });
+//     }
+//     return res.status(500).json({ success: false, message: authError?.body?.message || "Registration failed" });
+//   }
+
+//   if (!signUpResult?.user) {
+//     return res.status(500).json({ success: false, message: "Authentication provider failed." });
+//   }
+
+//   const userId = signUpResult.user.id;
+//   const userObjectId = new ObjectId(userId);
+
+//   const finalRole = (role === 'admin' || email.toLowerCase().includes('admin')) ? 'admin' : 'user';
+
+//   await usersCollection.updateOne(
+//     { _id: userObjectId },
+//     {
+//       $set: {
+//         role: finalRole,
+//         isBlocked: false,
+//         isPremium: false,
+//         createdAt: signUpResult.user.createdAt || new Date(),
+//         updatedAt: new Date()
+//       }
+//     }
+//   );
+
+//   const updatedUser = await usersCollection.findOne({ _id: userObjectId });
+
+//   if (!updatedUser) {
+//     return res.status(500).json({ success: false, message: "User created but could not be retrieved." });
+//   }
+
+//   const token = jwt.sign(
+//     { id: updatedUser._id.toString(), email: updatedUser.email, role: updatedUser.role || 'user' },
+//     process.env.JWT_SECRET || 'recipehub_jwt_secret_token_key_2026_xoxo',
+//     { expiresIn: '10d' }
+//   );
+
+//   res.cookie('token', token, {
+//     httpOnly: true,
+//     secure: process.env.NODE_ENV === 'production',
+//     sameSite: 'lax',
+//     maxAge: 10 * 24 * 60 * 60 * 1000
+//   });
+
+//   return res.status(201).json({
+//     success: true,
+//     message: "Registration successful",
+//     token,
+//     user: {
+//       id: updatedUser._id.toString(),
+//       name: updatedUser.name,
+//       email: updatedUser.email,
+//       image: updatedUser.image,
+//       role: updatedUser.role || 'user',
+//       isPremium: updatedUser.isPremium || false
+//     }
+//   });
+
+// } catch (error) {
+//   console.error("Register Error:", error);
+//   return res.status(500).json({ success: false, message: error.message || "Registration failed" });
+// }
+
+    // Store JWT in HTTPOnly Cookie
+//     res.cookie('token', token, {
+//       httpOnly: true,
+//       secure: process.env.NODE_ENV === 'production',
+//       sameSite: 'lax', // standard lax is best for cross-origin local cookies
+//       maxAge: 10 * 24 * 60 * 60 * 1000 // 10 days
+//     });
+
+//     return res.status(201).json({
+//       success: true,
+//       message: "Registration successful",
+//       token,
+//       user: {
+//         id: updatedUser._id.toString(),
+//         name: updatedUser.name,
+//         email: updatedUser.email,
+//         image: updatedUser.image,
+//         role: updatedUser.role || 'user',
+//         isPremium: updatedUser.isPremium || false
+//       }
+//     });
+//     console.log("signUpResult =", signUpResult);
+// console.log("userId =", signUpResult?.user?.id);
+
+//   } catch (error) {
+//     console.error("Register Error:", error);
+//     return res.status(500).json({ success: false, message: error.message || "Registration failed" });
+//   }
+// });
+
 // Login
-app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ success: false, message: "Email and password are required" });
-  }
+// app.post('/api/auth/login', async (req, res) => {
+//   const { email, password } = req.body;
+//   if (!email || !password) {
+//     return res.status(400).json({ success: false, message: "Email and password are required" });
+//   }
 
-  try {
-    const usersCollection = getCollection('users');
-    const user = await usersCollection.findOne({ email: email.toLowerCase() });
+//   try {
+//     const usersCollection = getCollection('users');
+//     const user = await usersCollection.findOne({ email: email.toLowerCase() });
 
-    if (!user) {
-      return res.status(400).json({ success: false, message: "Invalid email or password" });
-    }
+//     if (!user) {
+//       return res.status(400).json({ success: false, message: "Invalid email or password" });
+//     }
 
-    if (user.isBlocked) {
-      return res.status(403).json({ success: false, message: "Your account has been blocked by the administrator." });
-    }
+//     if (user.isBlocked) {
+//       return res.status(403).json({ success: false, message: "Your account has been blocked by the administrator." });
+//     }
 
     // Call Better Auth to verify credentials
+    // await auth.api.signInEmail({
+    //   body: {
+    //     email: email.toLowerCase(),
+    //     password,
+    //   }
+    // });
+
+    // Generate JWT token
+    // const token = jwt.sign(
+    //   { id: user._id.toString(), email: user.email, role: user.role || 'user' },
+    //   process.env.JWT_SECRET || 'recipehub_jwt_secret_token_key_2026_xoxo',
+    //   { expiresIn: '7d' }
+    // );
+
+    // Store JWT in HTTPOnly Cookie
+//     res.cookie('token', token, {
+//       httpOnly: true,
+//       secure: process.env.NODE_ENV === 'production',
+//       sameSite: 'lax',
+//       maxAge: 10 * 24 * 60 * 60 * 1000
+//     });
+
+//     return res.json({
+//       success: true,
+//       message: "Logged in successfully",
+//       token,
+//       user: {
+//         id: user._id.toString(),
+//         name: user.name,
+//         email: user.email,
+//         image: user.image,
+//         role: user.role || 'user',
+//         isPremium: user.isPremium || false
+//       }
+//     });
+
+//   } catch (error) {
+//     console.error("Login Error:", error);
+//     return res.status(400).json({ success: false, message: "Invalid email or password" });
+//   }
+// });
+// chatgpt login code
+
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  try {
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Email and password required"
+      });
+    }
+
+    // Verify password through Better Auth
     await auth.api.signInEmail({
       body: {
         email: email.toLowerCase(),
-        password,
+        password
       }
     });
 
-    // Generate JWT token
+    const usersCollection = getCollection("users");
+
+    const user = await usersCollection.findOne({
+      email: email.toLowerCase()
+    });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
+    }
+
     const token = jwt.sign(
-      { id: user._id.toString(), email: user.email, role: user.role || 'user' },
-      process.env.JWT_SECRET || 'recipehub_jwt_secret_token_key_2026_xoxo',
-      { expiresIn: '7d' }
+      {
+        id: user._id.toString(),
+        email: user.email,
+        role: user.role || "user"
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: "10d" }
     );
 
-    // Store JWT in HTTPOnly Cookie
-    res.cookie('token', token, {
+    res.cookie("token", token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
+      secure: false,
+      sameSite: "lax",
       maxAge: 10 * 24 * 60 * 60 * 1000
     });
 
     return res.json({
       success: true,
-      message: "Logged in successfully",
       token,
-      user: {
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-        image: user.image,
-        role: user.role || 'user',
-        isPremium: user.isPremium || false
-      }
+      user
     });
-
   } catch (error) {
-    console.error("Login Error:", error);
-    return res.status(400).json({ success: false, message: "Invalid email or password" });
+    console.error("LOGIN ERROR:", error);
+
+    return res.status(400).json({
+      success: false,
+      message: "Invalid email or password"
+    });
   }
 });
-
 // Google OAuth Login Sync Callback
 app.post('/api/auth/google-callback', async (req, res) => {
   const { email, name, image } = req.body;
@@ -883,6 +1171,42 @@ app.get('/api/payments/purchased', verifyToken, async (req, res) => {
   }
 });
 
+// Auto-purchase recipe on view
+app.post('/api/payments/auto-purchase', verifyToken, async (req, res) => {
+  const { recipeId } = req.body;
+  if (!recipeId) {
+    return res.status(400).json({ success: false, message: "Recipe ID is required" });
+  }
+
+  try {
+    const paymentsCollection = getCollection('payments');
+    
+    // Check if already purchased
+    const existing = await paymentsCollection.findOne({
+      userId: req.user.id,
+      recipeId: new ObjectId(recipeId)
+    });
+
+    if (!existing) {
+      const newPurchase = {
+        userEmail: req.user.email,
+        userId: req.user.id,
+        amount: 0, // Free auto-purchase on view
+        recipeId: new ObjectId(recipeId),
+        transactionId: `auto-${req.user.id}-${recipeId}`,
+        paymentStatus: 'paid',
+        paidAt: new Date()
+      };
+      await paymentsCollection.insertOne(newPurchase);
+    }
+
+    return res.json({ success: true, message: "Recipe added to purchased list" });
+  } catch (error) {
+    console.error("Auto purchase error:", error);
+    return res.status(500).json({ success: false, message: "Failed to record auto-purchase" });
+  }
+});
+
 // ==========================================
 // ADMIN DASHBOARD API ENDPOINTS
 // ==========================================
@@ -932,13 +1256,14 @@ app.put('/api/admin/users/:id/block', verifyAdmin, async (req, res) => {
     const usersCollection = getCollection('users');
     
     // Prevent blocking oneself
-    const userToBlock = await usersCollection.findOne({ _id: new ObjectId(id) });
+    const query = getUserIdQuery(id);
+    const userToBlock = await usersCollection.findOne(query);
     if (userToBlock && userToBlock.email === req.user.email) {
       return res.status(400).json({ success: false, message: "You cannot block yourself!" });
     }
 
     const result = await usersCollection.updateOne(
-      { _id: new ObjectId(id) },
+      query,
       { $set: { isBlocked: true, updatedAt: new Date() } }
     );
 
@@ -962,7 +1287,7 @@ app.put('/api/admin/users/:id/unblock', verifyAdmin, async (req, res) => {
   try {
     const usersCollection = getCollection('users');
     const result = await usersCollection.updateOne(
-      { _id: new ObjectId(id) },
+      getUserIdQuery(id),
       { $set: { isBlocked: false, updatedAt: new Date() } }
     );
 

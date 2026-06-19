@@ -1,7 +1,10 @@
+import dns from "node:dns" ;
+dns.setServers (["1.1.1.1", "1.0.0.1"]);
 import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "better-auth/adapters/mongodb";
 import { client } from "./db.js";
 import dotenv from 'dotenv';
+import { Server } from "node:http";
 
 dotenv.config();
 
