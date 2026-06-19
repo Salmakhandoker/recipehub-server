@@ -13,11 +13,7 @@ const db = client.db(process.env.AUTH_DB_NAME || 'new-database');
 export const auth = betterAuth({
   database: mongodbAdapter(db, {
     client,
-    collectionNames: {
-      user: "users",
-      session: "sessions",
-      account: "accounts",
-    },
+    usePlural: true,
   }),
   trustedOrigins: [
     "http://localhost:3000",

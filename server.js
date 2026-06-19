@@ -65,8 +65,9 @@ app.get('/api/health', (req, res) => {
   res.json({ status: "ok", database: dbConnected });
 });
 
-// chat-gpt code
+// cloude code
 
+// Register - FIX: _id এর বদলে email দিয়ে updateOne করো
 app.post('/api/auth/register', async (req, res) => {
   const { name, email, image, password, role } = req.body;
 
@@ -80,7 +81,6 @@ app.post('/api/auth/register', async (req, res) => {
 
     const usersCollection = getCollection("users");
 
-    // Check existing user
     const existingUser = await usersCollection.findOne({
       email: email.toLowerCase()
     });
@@ -92,15 +92,13 @@ app.post('/api/auth/register', async (req, res) => {
       });
     }
 
-    // Better Auth signup
+    // Better Auth দিয়ে signup
     const signUpResult = await auth.api.signUpEmail({
       body: {
         name,
         email: email.toLowerCase(),
         password,
-        image:
-          image ||
-          "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150"
+        image: image || "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150"
       }
     });
 
@@ -111,30 +109,15 @@ app.post('/api/auth/register', async (req, res) => {
       });
     }
 
-    const userId = signUpResult.user.id;
-
     const finalRole =
       role === "admin" || email.toLowerCase().includes("admin")
         ? "admin"
         : "user";
 
-
-        console.log("Searching user...");
-
-const userByEmail = await usersCollection.findOne({
-  email: email.toLowerCase()
-});
-
-console.log("userByEmail =", userByEmail);
-
-const userById = await usersCollection.findOne({
-  _id: signUpResult.user.id
-});
-
-console.log("userById =", userById);
-    // Update Better Auth created user
+    // ✅ FIX: _id এর বদলে email দিয়ে update করো
+    // কারণ Better Auth string ID ব্যবহার করে, ObjectId না
     await usersCollection.updateOne(
-      { _id: userId },
+      { email: email.toLowerCase() },
       {
         $set: {
           role: finalRole,
@@ -145,8 +128,9 @@ console.log("userById =", userById);
       }
     );
 
+    // ✅ FIX: email দিয়ে user খোঁজো
     const user = await usersCollection.findOne({
-      _id: userId
+      email: email.toLowerCase()
     });
 
     if (!user) {
@@ -160,7 +144,9 @@ console.log("userById =", userById);
       {
         id: user._id.toString(),
         email: user.email,
-        role: user.role
+        role: user.role || "user",
+        isPremium: user.isPremium || false,
+        name: user.name
       },
       process.env.JWT_SECRET,
       { expiresIn: "10d" }
@@ -176,17 +162,261 @@ console.log("userById =", userById);
     return res.status(201).json({
       success: true,
       token,
-      user
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        image: user.image,
+        role: user.role || "user",
+        isPremium: user.isPremium || false
+      }
     });
+
   } catch (error) {
     console.error("REGISTER ERROR:", error);
 
+    // ✅ Better Auth এর specific error handle করো
+    if (error?.body?.code === 'USER_ALREADY_EXISTS') {
+      return res.status(400).json({
+        success: false,
+        message: "Email already registered"
+      });
+    }
+
     return res.status(500).json({
       success: false,
-      message: error.message
+      message: error.message || "Registration failed"
     });
   }
 });
+
+
+// সাময়িক debug route - server.js এ add করো
+app.get('/api/debug/users', async (req, res) => {
+  const usersCollection = getCollection("users");
+  const all = await usersCollection.find({}).toArray();
+  console.log("ALL USERS:", JSON.stringify(all, null, 2));
+  res.json({ count: all.length, users: all });
+});
+
+// Login - FIX: blocked check আগে করো, token এ isPremium ও name রাখো
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  try {
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Email and password required"
+      });
+    }
+
+    const usersCollection = getCollection("users");
+
+    // ✅ FIX: Better Auth call করার আগে blocked check করো
+    const userCheck = await usersCollection.findOne({
+      email: email.toLowerCase()
+    });
+
+    if (!userCheck) {
+      return res.status(404).json({
+        success: false,
+        message: "No account found with this email"
+      });
+    }
+
+    if (userCheck.isBlocked) {
+      return res.status(403).json({
+        success: false,
+        message: "Your account has been blocked by the administrator."
+      });
+    }
+
+    // ✅ এখন Better Auth দিয়ে password verify করো
+    await auth.api.signInEmail({
+      body: {
+        email: email.toLowerCase(),
+        password
+      }
+    });
+
+    // Better Auth verify করলে এখন fresh user data নাও
+    const user = await usersCollection.findOne({
+      email: email.toLowerCase()
+    });
+
+    const token = jwt.sign(
+      {
+        id: user._id.toString(),
+        email: user.email,
+        role: user.role || "user",
+        isPremium: user.isPremium || false,
+        name: user.name
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: "10d" }
+    );
+
+    res.cookie("token", token, {
+      httpOnly: true,
+      secure: false,
+      sameSite: "lax",
+      maxAge: 10 * 24 * 60 * 60 * 1000
+    });
+
+    return res.json({
+      success: true,
+      token,
+      user: {
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        image: user.image,
+        role: user.role || "user",
+        isPremium: user.isPremium || false
+      }
+    });
+
+  } catch (error) {
+    console.error("LOGIN ERROR:", error);
+
+    // ✅ Better Auth এর error clearly handle করো
+    if (error?.statusCode === 401 || error?.body?.code === 'INVALID_EMAIL_OR_PASSWORD') {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid email or password"
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      message: "Login failed. Please try again."
+    });
+  }
+});
+
+// chat-gpt code
+
+// app.post('/api/auth/register', async (req, res) => {
+//   const { name, email, image, password, role } = req.body;
+
+//   try {
+//     if (!name || !email || !password) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "Name, email and password are required"
+//       });
+//     }
+
+//     const usersCollection = getCollection("users");
+
+//     // Check existing user
+//     const existingUser = await usersCollection.findOne({
+//       email: email.toLowerCase()
+//     });
+
+//     if (existingUser) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "Email already registered"
+//       });
+//     }
+
+//     // Better Auth signup
+//     const signUpResult = await auth.api.signUpEmail({
+//       body: {
+//         name,
+//         email: email.toLowerCase(),
+//         password,
+//         image:
+//           image ||
+//           "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150"
+//       }
+//     });
+
+//     if (!signUpResult?.user) {
+//       return res.status(500).json({
+//         success: false,
+//         message: "Signup failed"
+//       });
+//     }
+
+//     const userId = signUpResult.user.id;
+
+//     const finalRole =
+//       role === "admin" || email.toLowerCase().includes("admin")
+//         ? "admin"
+//         : "user";
+
+
+//         console.log("Searching user...");
+
+// const userByEmail = await usersCollection.findOne({
+//   email: email.toLowerCase()
+// });
+
+// console.log("userByEmail =", userByEmail);
+
+// const userById = await usersCollection.findOne({
+//   _id: signUpResult.user.id
+// });
+
+// console.log("userById =", userById);
+//     // Update Better Auth created user
+//     await usersCollection.updateOne(
+//       { _id: userId },
+//       {
+//         $set: {
+//           role: finalRole,
+//           isBlocked: false,
+//           isPremium: false,
+//           updatedAt: new Date()
+//         }
+//       }
+//     );
+
+//     const user = await usersCollection.findOne({
+//       _id: userId
+//     });
+
+//     if (!user) {
+//       return res.status(500).json({
+//         success: false,
+//         message: "User created but not found in database"
+//       });
+//     }
+
+//     const token = jwt.sign(
+//       {
+//         id: user._id.toString(),
+//         email: user.email,
+//         role: user.role
+//       },
+//       process.env.JWT_SECRET,
+//       { expiresIn: "10d" }
+//     );
+
+//     res.cookie("token", token, {
+//       httpOnly: true,
+//       secure: false,
+//       sameSite: "lax",
+//       maxAge: 10 * 24 * 60 * 60 * 1000
+//     });
+
+//     return res.status(201).json({
+//       success: true,
+//       token,
+//       user
+//     });
+//   } catch (error) {
+//     console.error("REGISTER ERROR:", error);
+
+//     return res.status(500).json({
+//       success: false,
+//       message: error.message
+//     });
+//   }
+// });
 
 // Register
 // app.post('/api/auth/register', async (req, res) => {
@@ -444,72 +674,74 @@ console.log("userById =", userById);
 //     return res.status(400).json({ success: false, message: "Invalid email or password" });
 //   }
 // });
+
+
 // chatgpt login code
 
 
-app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
+// app.post('/api/auth/login', async (req, res) => {
+//   const { email, password } = req.body;
 
-  try {
-    if (!email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: "Email and password required"
-      });
-    }
+//   try {
+//     if (!email || !password) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "Email and password required"
+//       });
+//     }
 
     // Verify password through Better Auth
-    await auth.api.signInEmail({
-      body: {
-        email: email.toLowerCase(),
-        password
-      }
-    });
+//     await auth.api.signInEmail({
+//       body: {
+//         email: email.toLowerCase(),
+//         password
+//       }
+//     });
 
-    const usersCollection = getCollection("users");
+//     const usersCollection = getCollection("users");
 
-    const user = await usersCollection.findOne({
-      email: email.toLowerCase()
-    });
+//     const user = await usersCollection.findOne({
+//       email: email.toLowerCase()
+//     });
 
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found"
-      });
-    }
+//     if (!user) {
+//       return res.status(404).json({
+//         success: false,
+//         message: "User not found"
+//       });
+//     }
 
-    const token = jwt.sign(
-      {
-        id: user._id.toString(),
-        email: user.email,
-        role: user.role || "user"
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: "10d" }
-    );
+//     const token = jwt.sign(
+//       {
+//         id: user._id.toString(),
+//         email: user.email,
+//         role: user.role || "user"
+//       },
+//       process.env.JWT_SECRET,
+//       { expiresIn: "10d" }
+//     );
 
-    res.cookie("token", token, {
-      httpOnly: true,
-      secure: false,
-      sameSite: "lax",
-      maxAge: 10 * 24 * 60 * 60 * 1000
-    });
+//     res.cookie("token", token, {
+//       httpOnly: true,
+//       secure: false,
+//       sameSite: "lax",
+//       maxAge: 10 * 24 * 60 * 60 * 1000
+//     });
 
-    return res.json({
-      success: true,
-      token,
-      user
-    });
-  } catch (error) {
-    console.error("LOGIN ERROR:", error);
+//     return res.json({
+//       success: true,
+//       token,
+//       user
+//     });
+//   } catch (error) {
+//     console.error("LOGIN ERROR:", error);
 
-    return res.status(400).json({
-      success: false,
-      message: "Invalid email or password"
-    });
-  }
-});
+//     return res.status(400).json({
+//       success: false,
+//       message: "Invalid email or password"
+//     });
+//   }
+// });
 // Google OAuth Login Sync Callback
 app.post('/api/auth/google-callback', async (req, res) => {
   const { email, name, image } = req.body;
