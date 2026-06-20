@@ -7,7 +7,7 @@ import { ObjectId } from 'mongodb';
 import { connectDB, getCollection } from './db.js';
 import { toNodeHandler } from "better-auth/node";
 import { auth } from "./auth.js";
-import { verifyToken, verifyAdmin } from './jwtMiddleware.js';
+import { verifyToken, verifyAdmin, getOptionalUser } from './jwtMiddleware.js';
 import Stripe from 'stripe';
 
 dotenv.config();
@@ -109,10 +109,7 @@ app.post('/api/auth/register', async (req, res) => {
       });
     }
 
-    const finalRole =
-      role === "admin" || email.toLowerCase().includes("admin")
-        ? "admin"
-        : "user";
+    const finalRole = "user";
 
     // ✅ FIX: _id এর বদলে email দিয়ে update করো
     // কারণ Better Auth string ID ব্যবহার করে, ObjectId না
@@ -857,7 +854,8 @@ app.post('/api/recipes', verifyToken, async (req, res) => {
     difficultyLevel,
     preparationTime,
     ingredients,
-    instructions
+    instructions,
+    isPremium
   } = req.body;
 
   if (!recipeName || !category || !cuisineType || !difficultyLevel || !preparationTime || !ingredients || !instructions) {
@@ -887,6 +885,7 @@ app.post('/api/recipes', verifyToken, async (req, res) => {
       preparationTime: parseInt(preparationTime, 10),
       ingredients: Array.isArray(ingredients) ? ingredients : ingredients.split(',').map(i => i.trim()),
       instructions,
+      isPremium: !!isPremium,
       authorId: req.user.id,
       authorName: req.user.name,
       authorEmail: req.user.email,
@@ -995,8 +994,33 @@ app.get('/api/recipes/:id', async (req, res) => {
     if (!recipe) {
       return res.status(404).json({ success: false, message: "Recipe not found" });
     }
-    return res.json({ success: true, data: recipe });
+
+    const user = await getOptionalUser(req);
+    let hasAccess = false;
+
+    if (user) {
+      const isAuthor = recipe.authorEmail === user.email;
+      const isAdmin = user.role === 'admin';
+
+      const paymentsCollection = getCollection('payments');
+      const purchase = await paymentsCollection.findOne({
+        userId: user.id,
+        recipeId: new ObjectId(id),
+        paymentStatus: 'paid'
+      });
+
+      hasAccess = isAuthor || isAdmin || !!purchase;
+    }
+
+    if (!hasAccess) {
+      // Omit ingredients and instructions for locked/unpurchased recipes
+      const { ingredients, instructions, ...publicRecipe } = recipe;
+      return res.json({ success: true, data: { ...publicRecipe, isLocked: true } });
+    }
+
+    return res.json({ success: true, data: { ...recipe, isLocked: false } });
   } catch (error) {
+    console.error("Get Single Recipe Error:", error);
     return res.status(400).json({ success: false, message: "Invalid Recipe ID" });
   }
 });
@@ -1028,6 +1052,9 @@ app.put('/api/recipes/:id', verifyToken, async (req, res) => {
     }
     if (allowedUpdates.ingredients && !Array.isArray(allowedUpdates.ingredients)) {
       allowedUpdates.ingredients = allowedUpdates.ingredients.split(',').map(i => i.trim());
+    }
+    if (allowedUpdates.isPremium !== undefined) {
+      allowedUpdates.isPremium = !!allowedUpdates.isPremium;
     }
 
     await recipesCollection.updateOne({ _id: new ObjectId(id) }, { $set: allowedUpdates });
@@ -1403,40 +1430,9 @@ app.get('/api/payments/purchased', verifyToken, async (req, res) => {
   }
 });
 
-// Auto-purchase recipe on view
+// Auto-purchase recipe on view (Disabled: all recipes require purchase)
 app.post('/api/payments/auto-purchase', verifyToken, async (req, res) => {
-  const { recipeId } = req.body;
-  if (!recipeId) {
-    return res.status(400).json({ success: false, message: "Recipe ID is required" });
-  }
-
-  try {
-    const paymentsCollection = getCollection('payments');
-    
-    // Check if already purchased
-    const existing = await paymentsCollection.findOne({
-      userId: req.user.id,
-      recipeId: new ObjectId(recipeId)
-    });
-
-    if (!existing) {
-      const newPurchase = {
-        userEmail: req.user.email,
-        userId: req.user.id,
-        amount: 0, // Free auto-purchase on view
-        recipeId: new ObjectId(recipeId),
-        transactionId: `auto-${req.user.id}-${recipeId}`,
-        paymentStatus: 'paid',
-        paidAt: new Date()
-      };
-      await paymentsCollection.insertOne(newPurchase);
-    }
-
-    return res.json({ success: true, message: "Recipe added to purchased list" });
-  } catch (error) {
-    console.error("Auto purchase error:", error);
-    return res.status(500).json({ success: false, message: "Failed to record auto-purchase" });
-  }
+  return res.status(400).json({ success: false, message: "Auto-purchase is disabled: all recipes require explicit Stripe payment." });
 });
 
 // ==========================================

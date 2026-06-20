@@ -49,3 +49,30 @@ export function verifyAdmin(req, res, next) {
     next();
   });
 }
+
+export async function getOptionalUser(req) {
+  const token = req.cookies?.token || (req.headers?.authorization?.startsWith('Bearer ') ? req.headers.authorization.split(' ')[1] : null);
+  if (!token) return null;
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'recipehub_jwt_secret_token_key_2026_xoxo');
+    const usersCollection = getCollection('users');
+    const user = await usersCollection.findOne({ email: decoded.email });
+    
+    if (!user || user.isBlocked) {
+      return null;
+    }
+
+    return {
+      id: user._id.toString(),
+      name: user.name,
+      email: user.email,
+      role: user.role || 'user',
+      isPremium: user.isPremium || false,
+      image: user.image
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
