@@ -1116,7 +1116,7 @@ app.post('/api/recipes/:id/report', verifyToken, async (req, res) => {
   }
 });
 
-// ==========================================
+
 // FAVORITES API ENDPOINTS
 // ==========================================
 
@@ -1130,7 +1130,7 @@ app.post('/api/favorites', verifyToken, async (req, res) => {
   try {
     const favoritesCollection = getCollection('favorites');
     
-    // Check if already in favorites
+    // Check if already in favorites;
     const existing = await favoritesCollection.findOne({
       userId: req.user.id,
       recipeId: new ObjectId(recipeId)
