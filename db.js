@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const uri = process.env.MONGO_DB_URI;
-const dbName = process.env.AUTH_DB_NAME || 'new-database';
+const dbName = process.env.AUTH_DB_NAME || 'political-science-department';
 
 if (!uri) {
   console.error("MONGO_DB_URI is not defined in the environment variables!");

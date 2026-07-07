@@ -8,7 +8,7 @@ import { Server } from "node:http";
 
 dotenv.config();
 
-const db = client.db(process.env.AUTH_DB_NAME || 'new-database');
+const db = client.db(process.env.AUTH_DB_NAME || 'political-science-department');
 
 export const auth = betterAuth({
   database: mongodbAdapter(db, {
@@ -17,8 +17,10 @@ export const auth = betterAuth({
   }),
   trustedOrigins: [
     "http://localhost:3000",
-    "http://127.0.0.1:3000"
-  ],
+    "http://127.0.0.1:3000",
+      "https://client-side-8jv1xvjww-salmakhandoker001-6644s-projects.vercel.app", // ← তোমার frontend URL
+    process.env.CLIENT_URL
+  ].filter(Boolean),
   emailAndPassword: {
     enabled: true,
     autoSignIn: true,
