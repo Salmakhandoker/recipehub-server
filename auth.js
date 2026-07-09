@@ -8,7 +8,7 @@ import { Server } from "node:http";
 
 dotenv.config();
 
-const db = client.db(process.env.AUTH_DB_NAME || 'political-science-department');
+const db = client.db(process.env.AUTH_DB_NAME || 'new-database');
 
 export const auth = betterAuth({
   database: mongodbAdapter(db, {

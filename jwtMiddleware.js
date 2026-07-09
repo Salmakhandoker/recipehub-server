@@ -9,7 +9,7 @@ export async function verifyToken(req, res, next) {
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'political-science_jwt_secret_token_key_2026_xoxo');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'recipehub_jwt_secret_token_key_2026_xoxo');
     
     // Check if user is blocked in the database
     const usersCollection = getCollection('users');
@@ -55,7 +55,7 @@ export async function getOptionalUser(req) {
   if (!token) return null;
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'political-science_jwt_secret_token_key_2026_xoxo');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'recipehub_jwt_secret_token_key_2026_xoxo');
     const usersCollection = getCollection('users');
     const user = await usersCollection.findOne({ email: decoded.email });
     
