@@ -42,13 +42,16 @@ const normalizeNote = (note) => {
 };
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 
 // Middleware
 const allowedOrigins = [
   'http://localhost:3000',
   'http://127.0.0.1:3000',
-  process.env.CLIENT_URL
+  'https://client-side-ochre.vercel.app',
+  'https://client-side-salmakhandoker001-6644s-projects.vercel.app',
+  process.env.FRONTEND_URL,
+  process.env.CLIENT_URL,
 ].filter(Boolean);
 
 app.use(cors({
@@ -109,10 +112,11 @@ app.get('/api/health', (req, res) => {
 
 // ROOT ROUTE
 app.get('/', (req, res) => {
-  if (process.env.CLIENT_URL) {
-    return res.redirect(process.env.CLIENT_URL);
+  const frontendUrl = process.env.FRONTEND_URL || process.env.CLIENT_URL;
+  if (frontendUrl) {
+    return res.redirect(frontendUrl);
   }
-  return res.json({ status: "ok", message: "note Hub Server API is running" });
+  return res.json({ status: "ok", message: "Recipe Hub Server API is running" });
 });
 
 // cloude code

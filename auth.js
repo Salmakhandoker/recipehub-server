@@ -18,8 +18,10 @@ export const auth = betterAuth({
   trustedOrigins: [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-      "https://client-side-8jv1xvjww-salmakhandoker001-6644s-projects.vercel.app", // ← তোমার frontend URL
-    process.env.CLIENT_URL
+    "https://client-side-ochre.vercel.app",
+    "https://client-side-salmakhandoker001-6644s-projects.vercel.app",
+    process.env.FRONTEND_URL,
+    process.env.CLIENT_URL,
   ].filter(Boolean),
   emailAndPassword: {
     enabled: true,
