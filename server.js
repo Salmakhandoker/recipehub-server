@@ -1,14 +1,15 @@
-﻿import express from 'express';
+import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 import jwt from 'jsonwebtoken';
 import { ObjectId } from 'mongodb';
-import { connectDB, getCollection } from './db.js';
+import { connectDB, getCollection, client } from './db.js';
 import { toNodeHandler } from "better-auth/node";
 import { auth } from "./auth.js";
 import { verifyToken, verifyAdmin, getOptionalUser } from './jwtMiddleware.js';
 import Stripe from 'stripe';
+import { generateRecipeWithAI, askSousChef, generatePantryRecipes } from './gemini.js';
 
 dotenv.config();
 
@@ -88,6 +89,42 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
 app.get('/api/health', (req, res) => {
   res.json({ status: "ok", database: dbConnected });
 });
+
+// DEBUG DB CONFIGURATION
+app.get('/api/debug-db', async (req, res) => {
+  try {
+    const adminDb = client.db().admin();
+    const dbsInfo = await adminDb.listDatabases();
+    
+    const dbList = [];
+    for (const dbInfo of dbsInfo.databases) {
+      const tempDb = client.db(dbInfo.name);
+      const collections = await tempDb.listCollections().toArray();
+      const colls = [];
+      for (const coll of collections) {
+        const count = await tempDb.collection(coll.name).countDocuments({});
+        colls.push({ name: coll.name, count });
+      }
+      dbList.push({ name: dbInfo.name, size: dbInfo.sizeOnDisk, collections: colls });
+    }
+
+    res.json({
+      success: true,
+      AUTH_DB_NAME: process.env.AUTH_DB_NAME || 'not-set',
+      MONGO_DB_URI: process.env.MONGO_DB_URI ? process.env.MONGO_DB_URI.replace(/:[^@]+@/, ':***@') : 'not-set',
+      databases: dbList
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message,
+      stack: err.stack,
+      AUTH_DB_NAME: process.env.AUTH_DB_NAME || 'not-set',
+      MONGO_DB_URI: process.env.MONGO_DB_URI ? process.env.MONGO_DB_URI.replace(/:[^@]+@/, ':***@') : 'not-set',
+    });
+  }
+});
+
 
 // ROOT ROUTE
 app.get('/', (req, res) => {
@@ -1306,6 +1343,118 @@ app.get('/api/auth/stats', verifyToken, async (req, res) => {
   } catch (error) {
     console.error("User Stats Error:", error);
     return res.status(500).json({ success: false, message: "Failed to fetch user stats overview" });
+  }
+});
+
+// ==========================================
+// AI FEATURES (POWERED BY GOOGLE GEMINI)
+// ==========================================
+
+// 1. AI Recipe Generator & Smart Auto-Fill
+app.post('/api/ai/generate-recipe', async (req, res) => {
+  try {
+    const { prompt, cuisine, category, dietaryPreference } = req.body;
+    if (!prompt && !cuisine && !category) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a recipe idea, ingredient, or cuisine preference."
+      });
+    }
+
+    const recipe = await generateRecipeWithAI({
+      prompt,
+      cuisine,
+      category,
+      dietaryPreference
+    });
+
+    return res.json({
+      success: true,
+      data: recipe
+    });
+  } catch (error) {
+    console.error("AI Recipe Generation Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Failed to generate recipe with AI"
+    });
+  }
+});
+
+// 2. AI Interactive Sous-Chef (Recipe Details)
+app.post('/api/ai/sous-chef', async (req, res) => {
+  try {
+    const { recipeId, recipe: providedRecipe, question, conversationHistory } = req.body;
+
+    if (!question) {
+      return res.status(400).json({
+        success: false,
+        message: "Question is required."
+      });
+    }
+
+    let recipe = providedRecipe;
+    if (!recipe && recipeId) {
+      try {
+        const recipesCollection = getCollection('recipes');
+        recipe = await recipesCollection.findOne({ _id: new ObjectId(recipeId) });
+      } catch (err) {
+        console.warn("Could not find recipe by ID for sous-chef:", err.message);
+      }
+    }
+
+    if (!recipe) {
+      recipe = { recipeName: "Recipe" };
+    }
+
+    const result = await askSousChef({
+      recipe,
+      question,
+      conversationHistory
+    });
+
+    return res.json({
+      success: true,
+      data: result
+    });
+  } catch (error) {
+    console.error("AI Sous Chef Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Sous Chef failed to answer"
+    });
+  }
+});
+
+// 3. AI Pantry Chef ("What's In My Fridge?")
+app.post('/api/ai/pantry-chef', async (req, res) => {
+  try {
+    const { ingredients, mealType, maxTime, dietaryPreference } = req.body;
+
+    if (!ingredients || (Array.isArray(ingredients) && ingredients.length === 0)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide at least one pantry or fridge ingredient."
+      });
+    }
+
+    const recipes = await generatePantryRecipes({
+      ingredients,
+      mealType,
+      maxTime,
+      dietaryPreference
+    });
+
+    return res.json({
+      success: true,
+      data: recipes
+    });
+  } catch (error) {
+    console.error("AI Pantry Chef Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Failed to generate pantry recipes"
+    });
   }
 });
 
