@@ -1,4 +1,4 @@
-import express from 'express';
+﻿import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
@@ -874,28 +874,34 @@ app.get('/api/favorites', verifyToken, async (req, res) => {
 });
 
 // ==========================================
+//// ==========================================
 // PAYMENTS & STRIPE API ENDPOINTS
 // ==========================================
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:3000';
 
 // Create Checkout Session
 app.post('/api/create-checkout-session', verifyToken, async (req, res) => {
-  const { type, recipeId } = req.body; // type can be 'premium' or 'recipe'
-  
+  const { type, recipeId } = req.body;
+
   if (!type || !['premium', 'recipe'].includes(type)) {
     return res.status(400).json({ success: false, message: "Valid purchase type is required (premium or recipe)" });
   }
 
   try {
     let line_items = [];
-    let metadata = {
+    const metadata = {
       userId: req.user.id,
       userEmail: req.user.email,
       type
     };
 
     if (type === 'premium') {
+      if (req.user.isPremium) {
+        return res.status(400).json({ success: false, message: "You are already a premium member" });
+      }
+
       line_items = [{
         price_data: {
           currency: 'usd',
@@ -908,30 +914,43 @@ app.post('/api/create-checkout-session', verifyToken, async (req, res) => {
         quantity: 1,
       }];
     } else {
-      if (!recipeId) {
-        return res.status(400).json({ success: false, message: "Recipe ID is required for recipe purchase" });
+      if (!recipeId || !ObjectId.isValid(recipeId)) {
+        return res.status(400).json({ success: false, message: "Valid Recipe ID is required for recipe purchase" });
       }
-      
-      const recipesCollection = getCollection('recipes');
-      const recipe = await recipesCollection.findOne({ _id: new ObjectId(recipeId) });
-      
+
+      const recipe = await getCollection('recipes').findOne({ _id: new ObjectId(recipeId) });
       if (!recipe) {
         return res.status(404).json({ success: false, message: "Recipe not found" });
+      }
+
+      // ইতিমধ্যে কেনা থাকলে আবার কেনা যাবে না
+      const alreadyBought = await getCollection('payments').findOne({
+        userId: req.user.id,
+        recipeId: new ObjectId(recipeId),
+        paymentStatus: 'paid'
+      });
+      if (alreadyBought) {
+        return res.status(400).json({ success: false, message: "You already purchased this recipe" });
+      }
+
+      const productData = {
+        name: `Recipe Purchase: ${recipe.recipeName}`,
+        description: `Author: ${recipe.authorName} | Cuisine: ${recipe.cuisineType}`,
+      };
+      // শুধু বৈধ https ছবি পাঠান, নাহলে Stripe error দেয়
+      if (typeof recipe.recipeImage === 'string' && recipe.recipeImage.startsWith('https://')) {
+        productData.images = [recipe.recipeImage];
       }
 
       line_items = [{
         price_data: {
           currency: 'usd',
-          product_data: {
-            name: `Recipe Purchase: ${recipe.recipeName}`,
-            description: `Author: ${recipe.authorName} | Cuisine: ${recipe.cuisineType}`,
-            images: [recipe.recipeImage],
-          },
+          product_data: productData,
           unit_amount: 499, // $4.99
         },
         quantity: 1,
       }];
-      
+
       metadata.recipeId = recipeId;
     }
 
@@ -939,8 +958,8 @@ app.post('/api/create-checkout-session', verifyToken, async (req, res) => {
       payment_method_types: ['card'],
       line_items,
       mode: 'payment',
-      success_url: `http://localhost:3000/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `http://localhost:3000/recipes`,
+      success_url: `${CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${CLIENT_URL}/recipes`,
       metadata
     });
 
@@ -955,33 +974,28 @@ app.post('/api/create-checkout-session', verifyToken, async (req, res) => {
 // Verify Stripe Payment Session
 app.post('/api/payments/verify', verifyToken, async (req, res) => {
   const { sessionId } = req.body;
-  if (!sessionId) {
+  if (!sessionId || typeof sessionId !== 'string') {
     return res.status(400).json({ success: false, message: "Session ID is required" });
   }
 
   try {
     const session = await stripe.checkout.sessions.retrieve(sessionId);
+
     if (session.payment_status !== 'paid') {
       return res.status(400).json({ success: false, message: "Payment was not completed successfully" });
     }
 
     const { type, userId, userEmail, recipeId } = session.metadata;
-    const paymentsCollection = getCollection('payments');
-    
-    // Check if this payment intent has already been saved
-    const paymentIntent = session.payment_intent;
-    const existingPayment = await paymentsCollection.findOne({ transactionId: paymentIntent });
 
-    if (existingPayment) {
-      return res.json({
-        success: true,
-        message: "Payment verified (already processed)",
-        data: existingPayment
-      });
+    // এই পেমেন্ট কি সত্যিই এই লগইন করা ব্যবহারকারীর?
+    if (userId !== req.user.id) {
+      return res.status(403).json({ success: false, message: "This payment does not belong to you" });
     }
 
-    // Record the payment in the DB
-    const newPayment = {
+    const paymentsCollection = getCollection('payments');
+    const paymentIntent = session.payment_intent;
+
+    const paymentDoc = {
       userEmail,
       userId,
       amount: session.amount_total / 100,
@@ -991,12 +1005,18 @@ app.post('/api/payments/verify', verifyToken, async (req, res) => {
       paidAt: new Date()
     };
 
-    await paymentsCollection.insertOne(newPayment);
+    // upsert: একই transactionId দুবার সেভ হবে না (race condition থেকে নিরাপদ)
+    const upsertResult = await paymentsCollection.updateOne(
+      { transactionId: paymentIntent },
+      { $setOnInsert: paymentDoc },
+      { upsert: true }
+    );
 
-    // If type is premium, update user isPremium status
+    const alreadyProcessed = upsertResult.upsertedCount === 0;
+
+    // premium হলে ব্যবহারকারীকে আপগ্রেড করুন (বারবার চালালেও সমস্যা নেই)
     if (type === 'premium') {
-      const usersCollection = getCollection('users');
-      await usersCollection.updateOne(
+      await getCollection('users').updateOne(
         { email: userEmail },
         { $set: { isPremium: true, updatedAt: new Date() } }
       );
@@ -1004,8 +1024,10 @@ app.post('/api/payments/verify', verifyToken, async (req, res) => {
 
     return res.json({
       success: true,
-      message: "Payment successfully verified and saved!",
-      data: newPayment
+      message: alreadyProcessed
+        ? "Payment verified (already processed)"
+        : "Payment successfully verified and saved!",
+      data: paymentDoc
     });
 
   } catch (error) {
@@ -1014,17 +1036,11 @@ app.post('/api/payments/verify', verifyToken, async (req, res) => {
   }
 });
 
-// List Purchased Recipes for current user
+// List Purchased Recipes for current user (আগের মতোই, কোনো পরিবর্তন নেই)
 app.get('/api/payments/purchased', verifyToken, async (req, res) => {
   try {
-    const paymentsCollection = getCollection('payments');
-    const purchases = await paymentsCollection.aggregate([
-      { 
-        $match: { 
-          userId: req.user.id, 
-          recipeId: { $ne: null } 
-        } 
-      },
+    const purchases = await getCollection('payments').aggregate([
+      { $match: { userId: req.user.id, recipeId: { $ne: null } } },
       {
         $lookup: {
           from: 'recipes',
@@ -1053,14 +1069,13 @@ app.get('/api/payments/purchased', verifyToken, async (req, res) => {
     ]).toArray();
 
     return res.json({ success: true, data: purchases });
-
   } catch (error) {
     console.error("Get Purchased Recipes Error:", error);
     return res.status(500).json({ success: false, message: "Failed to fetch purchased recipes" });
   }
 });
 
-// Auto-purchase recipe on view (Disabled: all recipes require purchase)
+// Auto-purchase (বন্ধ)
 app.post('/api/payments/auto-purchase', verifyToken, async (req, res) => {
   return res.status(400).json({ success: false, message: "Auto-purchase is disabled: all recipes require explicit Stripe payment." });
 });
@@ -1346,115 +1361,130 @@ app.get('/api/auth/stats', verifyToken, async (req, res) => {
   }
 });
 
+
 // ==========================================
 // AI FEATURES (POWERED BY GOOGLE GEMINI)
 // ==========================================
 
+const AI_TIMEOUT_MS = 45000; // must be lower than your Next.js proxyTimeout
+
+// Rejects if the AI call takes too long, so the request can never hang
+const withTimeout = (promise, ms = AI_TIMEOUT_MS) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => {
+        const err = new Error("The AI took too long to respond.");
+        err.status = 504;
+        reject(err);
+      }, ms)
+    ),
+  ]);
+
+// Converts any AI error into a clean JSON response
+const sendAIError = (res, error, label, fallbackMessage) => {
+  console.error(`${label}:`, error);
+
+  const status = error?.status || error?.code;
+  const busy = status === 503 || status === 429 || status === 504;
+
+  if (busy) {
+    return res.status(503).json({
+      success: false,
+      retryable: true,
+      message: "The AI chef is busy right now. Please try again in a moment.",
+    });
+  }
+
+  return res.status(500).json({
+    success: false,
+    message: fallbackMessage,
+  });
+};
+
 // 1. AI Recipe Generator & Smart Auto-Fill
-app.post('/api/ai/generate-recipe', async (req, res) => {
+app.post('/api/ai/generate-recipe', verifyToken, async (req, res) => {
   try {
     const { prompt, cuisine, category, dietaryPreference } = req.body;
+
     if (!prompt && !cuisine && !category) {
       return res.status(400).json({
         success: false,
-        message: "Please provide a recipe idea, ingredient, or cuisine preference."
+        message: "Please provide a recipe idea, ingredient, or cuisine preference.",
       });
     }
 
-    const recipe = await generateRecipeWithAI({
-      prompt,
-      cuisine,
-      category,
-      dietaryPreference
-    });
+    const recipe = await withTimeout(
+      generateRecipeWithAI({ prompt, cuisine, category, dietaryPreference })
+    );
 
-    return res.json({
-      success: true,
-      data: recipe
-    });
+    return res.json({ success: true, data: recipe });
   } catch (error) {
-    console.error("AI Recipe Generation Error:", error);
-    return res.status(500).json({
-      success: false,
-      message: error.message || "Failed to generate recipe with AI"
-    });
+    return sendAIError(res, error, "AI Recipe Generation Error", "Failed to generate recipe with AI");
   }
 });
 
 // 2. AI Interactive Sous-Chef (Recipe Details)
-app.post('/api/ai/sous-chef', async (req, res) => {
+app.post('/api/ai/sous-chef', verifyToken, async (req, res) => {
   try {
     const { recipeId, recipe: providedRecipe, question, conversationHistory } = req.body;
 
-    if (!question) {
-      return res.status(400).json({
-        success: false,
-        message: "Question is required."
-      });
+    if (!question || typeof question !== 'string' || !question.trim()) {
+      return res.status(400).json({ success: false, message: "Question is required." });
+    }
+    if (question.length > 1000) {
+      return res.status(400).json({ success: false, message: "Question is too long." });
     }
 
     let recipe = providedRecipe;
     if (!recipe && recipeId) {
       try {
-        const recipesCollection = getCollection('recipes');
-        recipe = await recipesCollection.findOne({ _id: new ObjectId(recipeId) });
+        recipe = await getCollection('recipes').findOne({ _id: new ObjectId(recipeId) });
       } catch (err) {
         console.warn("Could not find recipe by ID for sous-chef:", err.message);
       }
     }
+    if (!recipe) recipe = { recipeName: "Recipe" };
 
-    if (!recipe) {
-      recipe = { recipeName: "Recipe" };
-    }
+    // Keep only the last 10 messages so prompts stay small and fast
+    const history = Array.isArray(conversationHistory) ? conversationHistory.slice(-10) : [];
 
-    const result = await askSousChef({
-      recipe,
-      question,
-      conversationHistory
-    });
+    const result = await withTimeout(
+      askSousChef({ recipe, question: question.trim(), conversationHistory: history })
+    );
 
-    return res.json({
-      success: true,
-      data: result
-    });
+    return res.json({ success: true, data: result });
   } catch (error) {
-    console.error("AI Sous Chef Error:", error);
-    return res.status(500).json({
-      success: false,
-      message: error.message || "Sous Chef failed to answer"
-    });
+    return sendAIError(res, error, "AI Sous Chef Error", "Sous Chef failed to answer");
   }
 });
 
 // 3. AI Pantry Chef ("What's In My Fridge?")
-app.post('/api/ai/pantry-chef', async (req, res) => {
+app.post('/api/ai/pantry-chef', verifyToken, async (req, res) => {
   try {
     const { ingredients, mealType, maxTime, dietaryPreference } = req.body;
 
-    if (!ingredients || (Array.isArray(ingredients) && ingredients.length === 0)) {
+    const list = Array.isArray(ingredients)
+      ? ingredients.map((i) => String(i).trim()).filter(Boolean)
+      : String(ingredients || "").split(',').map((i) => i.trim()).filter(Boolean);
+
+    if (list.length === 0) {
       return res.status(400).json({
         success: false,
-        message: "Please provide at least one pantry or fridge ingredient."
+        message: "Please provide at least one pantry or fridge ingredient.",
       });
     }
+    if (list.length > 30) {
+      return res.status(400).json({ success: false, message: "Please provide 30 ingredients or fewer." });
+    }
 
-    const recipes = await generatePantryRecipes({
-      ingredients,
-      mealType,
-      maxTime,
-      dietaryPreference
-    });
+    const recipes = await withTimeout(
+      generatePantryRecipes({ ingredients: list, mealType, maxTime, dietaryPreference })
+    );
 
-    return res.json({
-      success: true,
-      data: recipes
-    });
+    return res.json({ success: true, data: recipes });
   } catch (error) {
-    console.error("AI Pantry Chef Error:", error);
-    return res.status(500).json({
-      success: false,
-      message: error.message || "Failed to generate pantry recipes"
-    });
+    return sendAIError(res, error, "AI Pantry Chef Error", "Failed to generate pantry recipes");
   }
 });
 
@@ -1468,4 +1498,3 @@ app.use((err, req, res, next) => {
 });
 
 export default app;
-
